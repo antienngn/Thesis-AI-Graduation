@@ -1,0 +1,10 @@
+{
+  "model": {
+    "pred_model": "prajjwal1/bert-tiny",
+    "num_labels": 1,
+    "mtype": "rank",
+    "activation": null,
+    "max_length": 512,
+    "max_batch_size": 1000
+  }
+}

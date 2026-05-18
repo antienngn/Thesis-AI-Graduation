@@ -1,0 +1,1 @@
+python data_dist.py --lmsys-file lmsys-Meta-Llama-3-8B-Instruct-t1.0-s0-l8192-c10000-rFalse.jsonl --sharegpt-file llama3-8b-sharegpt-test-t1-s0-8192.jsonl

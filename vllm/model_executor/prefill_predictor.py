@@ -25,11 +25,21 @@ class PredModel(nn.Module):
         self.model = AutoModelForSequenceClassification.from_pretrained(pred_model,                                                           num_labels=num_labels)
         self.mtype = mtype
         self.tokenizer = AutoTokenizer.from_pretrained(pred_model if tokenizer_name is None else tokenizer_name)
+        # Một số tokenizer (GPT-NeoX/Pythia) không có pad_token mặc định —
+        # padding=True trong score()/training sẽ raise. Reuse eos_token làm
+        # pad. Cũng sync model.config.pad_token_id để
+        # *ForSequenceClassification (xử lý sequence-final pooling theo
+        # last-non-pad position) tìm đúng vị trí logit.
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
         self.activation = torch.nn.Identity() if activation is None else instantiate_class(
             "torch.nn.modules.activation", activation)
         self.max_length = max_length
         self.max_batch_size = max_batch_size
         self.num_labels = num_labels
+        # Flag để _call_model() switch sang keyword args cho GPT2 family.
+        self._is_gpt2_family = getattr(self.model.config, "model_type", "") == "gpt2"
         if self.mtype == "rank":
             assert num_labels == 1
 
@@ -42,15 +52,17 @@ class PredModel(nn.Module):
         for i in range(0, len(prompts), self.max_batch_size):
             cur_prompts = prompts[i:min(len(prompts), i + self.max_batch_size)] 
             t1 = time.time()
-            inps = self.tokenizer(cur_prompts, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt")
-            input_ids = inps['input_ids'].to("cuda:0")
-            attention_mask = inps['attention_mask'].to("cuda:0")
+            with torch.profiler.record_function("predictor.tokenize"):
+                inps = self.tokenizer(cur_prompts, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt")
+                input_ids = inps['input_ids'].to("cuda:0")
+                attention_mask = inps['attention_mask'].to("cuda:0")
             t2 = time.time()
             ts += t2 - t1
-            if self.mtype == "class":
-                ret.append( self.model(input_ids, attention_mask).argmax(dim=-1) )
-            elif self.mtype == "rank":
-                ret.append( self.activation(self.model(input_ids, attention_mask).logits) )
+            with torch.profiler.record_function("predictor.forward"):
+                if self.mtype == "class":
+                    ret.append( self._call_model(input_ids, attention_mask).argmax(dim=-1) )
+                elif self.mtype == "rank":
+                    ret.append( self.activation(self._call_model(input_ids, attention_mask).logits) )
         return ret
         
     def forward(self, input_ids, attention_mask):
@@ -75,11 +87,21 @@ class PredModel(nn.Module):
 
         #return prediction
         if self.mtype == "class":
-            return self.model(input_ids, attention_mask).logits
+            return self._call_model(input_ids, attention_mask).logits
         elif self.mtype == "rank":
-            return self.activation(self.model(input_ids, attention_mask).logits)
+            return self.activation(self._call_model(input_ids, attention_mask).logits)
         else:
             assert False, "not support"
+
+    def _call_model(self, input_ids, attention_mask):
+        # GPT2 family (gpt2, distilgpt2, ...) có positional arg #2 là
+        # `past_key_values` (không phải attention_mask như BERT/GPTNeoX) →
+        # gọi positional sẽ nhầm attention_mask thành past_key_values và
+        # crash. Riêng nhánh này dùng keyword args; các architecture khác
+        # giữ positional để minimize diff.
+        if self._is_gpt2_family:
+            return self.model(input_ids=input_ids, attention_mask=attention_mask)
+        return self.model(input_ids, attention_mask)
 
 def prefill_predictor_model(pred_model, num_labels, mtype, activation, max_length, max_batch_size, tokenizer_name=None):
     """

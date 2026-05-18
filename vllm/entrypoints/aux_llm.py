@@ -125,6 +125,42 @@ class AUXLLM:
     def obtain_aux_scores(self, seq_groups):
         self.llm_engine.obtain_aux_scores(seq_groups)
 
+    # ============================================================
+    # Streaming-API shims for parity với OpenVINOPredictor
+    # ============================================================
+    # `opt-cpu-async-warmup` và `opt-cpu-async-merged` scheduler call
+    # poll_streaming() + submit_streaming() trên aux_model. OpenVINOPredictor
+    # implement bằng background worker thread + queue. AUXLLM (vLLM trên GPU)
+    # không có worker thread, nên ta map streaming → sync:
+    #   - poll_streaming: no-op (scores set inline trong submit_streaming)
+    #   - submit_streaming: block-call obtain_aux_scores
+    # Trade-off: predictor latency nằm trên critical path của scheduler tick
+    # (giống sync path opt-xxx), nhưng vẫn cho phép schedule_type
+    # `opt-cpu-async-merged` chạy trên AUXLLM để bench predictor latency.
+    # ============================================================
+    def poll_streaming(self) -> int:
+        """No-op cho AUXLLM (scores đã set inline). Trả 0 cho API parity."""
+        return 0
+
+    def submit_streaming(self, seq_groups) -> bool:
+        """Sync wrapper: gọi obtain_aux_scores ngay, scores set inline.
+
+        Returns True nếu có seq_groups (giống OpenVINOPredictor.submit_streaming
+        return new_count > 0).
+        """
+        if not seq_groups:
+            return False
+        self.llm_engine.obtain_aux_scores(seq_groups)
+        return True
+
+    def stream_stats(self) -> tuple:
+        """No-op stats cho profiler. AUXLLM không có queue/in_flight."""
+        return (0, 0)
+
+    def has_pending_stream(self) -> bool:
+        """No-op diagnostic. AUXLLM không có pending state."""
+        return False
+
     def get_tokenizer(
             self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
         return self.llm_engine.tokenizer.tokenizer

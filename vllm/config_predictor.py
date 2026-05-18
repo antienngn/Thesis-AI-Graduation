@@ -39,13 +39,23 @@ class ModelConfig:
 
 @attrs
 class PrefillModelConfig:
-    pred_model = attrib(type=str) 
+    pred_model = attrib(type=str)
     num_labels = attrib(type=int)
     mtype = attrib(type=str)
     activation = attrib(type=str)
     path = attrib(type=str, default="")
     max_length = attrib(type=int, default=1024)
     max_batch_size = attrib(type=int, default=512)
+    # === [opt-cpu] BEGIN ===
+    # `device` quyết định backend chạy predictor:
+    #   - "auto" (default): giữ flow cũ → AUXLLM trên GPU.
+    #   - "openvino": dùng OpenVINOPredictor chạy trên CPU.
+    # `num_threads`, `inference_precision` chỉ áp dụng khi device="openvino";
+    # tham số được forward thẳng vào openvino.Core.compile_model config.
+    device = attrib(type=str, default="auto")
+    num_threads = attrib(type=int, default=8)
+    inference_precision = attrib(type=str, default="f16")
+    # === [opt-cpu] END ===
 
 @attrs
 class PositionalEncoding:

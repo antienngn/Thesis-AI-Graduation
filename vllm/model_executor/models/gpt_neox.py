@@ -208,10 +208,17 @@ class GPTNeoXModel(nn.Module):
         hidden_states = self.embed_in(input_ids)
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            # Aux-model path (0 KV blocks): kv_caches[i] là tensor empty
+            # (.numel() == 0) → split_kv_cache fail vì view([0,...,-1,...])
+            # với 0 elements không infer được -1. Pass None giống pattern
+            # ở OPTModel.forward để attention layer chạy không cần cache.
+            kv_cache = kv_caches[i]
+            if kv_cache is not None and kv_cache.numel() == 0:
+                kv_cache = None
             hidden_states = layer(
                 position_ids,
                 hidden_states,
-                kv_caches[i],
+                kv_cache,
                 attn_metadata,
             )
         hidden_states = self.final_layer_norm(hidden_states)
@@ -279,6 +286,110 @@ class GPTNeoXForCausalLM(nn.Module):
                 # (num_heads * 3 * head_size), while the
                 # required shape is (3 * num_heads * head_size).
                 # Thus, we need weight conversion.
+                output_dim = getattr(param, "output_dim", None)
+                num_heads = self.config.num_attention_heads
+                if output_dim is not None:
+                    loaded_weight_shape = loaded_weight.shape
+                    loaded_weight = loaded_weight.view(
+                        loaded_weight_shape[:output_dim] + (num_heads, 3, -1) +
+                        loaded_weight_shape[output_dim + 1:])
+                    loaded_weight = loaded_weight.transpose(
+                        output_dim, output_dim + 1)
+                    loaded_weight = loaded_weight.reshape(loaded_weight_shape)
+
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+
+class GPTNeoXForSequenceClassification(nn.Module):
+    """GPTNeoX with a sequence classification / scoring head.
+
+    Adapted theo template OPTForSequenceClassification trong opt.py.
+    Khác GPTNeoXForCausalLM:
+      - Thay `embed_out` (LM head) bằng `score` (Linear → num_labels)
+      - forward trả về (hidden_states, pred_scores) cho parity với OPT
+        sequence-class path (pred_scores=None vì GPTNeoX không có internal
+        predictor như OPT extension)
+      - compute_logits dùng self.score.weight + argmax khi num_labels > 1
+      - sample truyền aux_model_scores=logits[:,0] cho ranking pipeline
+      - load_weights: skip embed_out.weight (không có trong seq-class
+        checkpoint); score.weight load qua default path
+    """
+
+    def __init__(
+        self,
+        config,
+        linear_method: Optional[LinearMethodBase] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.linear_method = linear_method
+        self.gpt_neox = GPTNeoXModel(config, linear_method)
+        self.num_labels = config.num_labels
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.sampler = Sampler()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        hidden_states = self.gpt_neox(input_ids, positions, kv_caches,
+                                      attn_metadata)
+        # pred_scores=None: GPTNeoX không có sub-predictor như OPT extension;
+        # tuple để khớp signature với OPTForSequenceClassification.sample.
+        return hidden_states, None
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.score.weight, hidden_states,
+                                       sampling_metadata)
+        if self.num_labels > 1 and logits is not None:
+            logits = logits[:, :self.num_labels].argmax(dim=-1,
+                                                       keepdim=True).float()
+        return logits
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        pred_scores,
+    ) -> Optional[SamplerOutput]:
+        assert logits.dim() == 2
+        next_tokens = self.sampler(
+            logits, sampling_metadata,
+            pred_scores=pred_scores,
+            aux_model_scores=logits[:, 0].tolist(),
+        )
+        return next_tokens
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            # Skip patterns identical to GPTNeoXForCausalLM
+            if ("attention.bias" in name or "attention.masked_bias" in name
+                    or "rotary_emb.inv_freq" in name):
+                continue
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                continue
+            # Seq-class checkpoint không có embed_out (LM head); defensive
+            # skip nếu checkpoint nào đó vẫn còn tensor này.
+            if "embed_out.weight" in name:
+                continue
+            # Tensor không có trong model (e.g. unused) → skip thay vì crash.
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+
+            if "query_key_value" in name:
+                # NOTE: GPT-NeoX's fused QKV's output_dim has the shape of
+                # (num_heads * 3 * head_size), while the required shape is
+                # (3 * num_heads * head_size). Thus, we need weight conversion.
                 output_dim = getattr(param, "output_dim", None)
                 num_heads = self.config.num_attention_heads
                 if output_dim is not None:

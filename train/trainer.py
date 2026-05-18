@@ -16,6 +16,9 @@ from allrank.utils.file_utils import create_output_dirs, PathsContainer, copy_lo
 import os
 from tqdm import tqdm
 import math
+# [best-tau] copy.deepcopy dùng để snapshot state_dict khi epoch hiện tại có
+# tau test cao nhất. State_dict được restore vào model trước save_pretrained.
+import copy
 
 def parse_args():
     parser = ArgumentParser("allRank")
@@ -103,6 +106,11 @@ def run():
     with set_default_torch_dtype(torch.float32):
         with torch.device('cuda'):
             predictor = prefill_predictor_model(pred_model=config.model.pred_model, num_labels=config.model.num_labels, mtype=config.model.mtype, activation=config.model.activation, max_length=config.model.max_length, max_batch_size=config.model.max_batch_size)
+    # `torch.device('cuda')` không reliably move pretrained weights cho mọi
+    # architecture (vd DistilBERT load checkpoint về CPU → embedding mismatch
+    # với input cuda:0). Force toàn bộ predictor lên cuda:0 — idempotent nếu
+    # đã đúng device.
+    predictor = predictor.to("cuda:0")
 
     dataset_path = args.file
     dataset = []
@@ -131,6 +139,14 @@ def run():
     elif args.loss == 'crossentropy':
         loss_func = torch.nn.CrossEntropyLoss()
 
+    # [best-tau] Track epoch có Kendall's Tau test cao nhất. Trainer trước đây
+    # save weights cuối loop (overfit risk với epoch lớn + model nhỏ). Giờ
+    # snapshot state_dict mỗi khi tau cải thiện, restore trước save_pretrained.
+    best_tau = -float('inf')
+    best_epoch = 0
+    best_state = None
+    tau_history = []
+
     for epoch in range(args.epoch):
         predictor.model.train()
         total_loss = 0
@@ -142,11 +158,11 @@ def run():
             
             input_ids = encoded_inputs['input_ids'].to("cuda:0")
             attention_mask = encoded_inputs['attention_mask'].to("cuda:0")
-                
+
             with torch.autocast(device_type="cuda"):
 
                 outputs = predictor(input_ids, attention_mask)
-                
+
                 labels = labels.reshape(1, -1)
                 labels = labels.to("cuda")
                 if args.loss == 'crossentropy':
@@ -197,7 +213,26 @@ def run():
 
             if args.loss == 'crossentropy':
                 print("acc: ", (np.array(train_labels) == np.array(predictions) ).sum() / len(train_labels) )
-    
+
+        # [best-tau] Update best snapshot nếu tau epoch này cao hơn. Tau từ
+        # kendalltau(label, prediction) — cả 2 đều inverse-of-length → positive
+        # direction, "cao nhất" = most positive. deepcopy state_dict tốn RAM
+        # ~size model FP32 (Pythia-14m: 30MB, Pythia-70m: 180MB) — chấp nhận
+        # được để tránh I/O save_pretrained mỗi epoch.
+        tau_history.append(float(tau))
+        if tau > best_tau:
+            best_tau = tau
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(predictor.model.state_dict())
+            print(f"  → new best @ epoch {best_epoch}, tau={tau:.4f}")
+
+    # [best-tau] Restore weights của epoch có tau cao nhất trước khi save.
+    # Nếu loop chưa từng update best (vd args.epoch=0), bỏ qua restore — model
+    # giữ nguyên state hiện tại.
+    if best_state is not None:
+        predictor.model.load_state_dict(best_state)
+        print(f"\nRestored best-tau weights: epoch {best_epoch}, tau={best_tau:.4f}")
+
     paths = PathsContainer.from_args(args.job_dir, args.run_id, prefill_predictor_model_config)
     
     usage_config_path = os.path.join(paths.output_dir, "usage_config.json")
@@ -207,13 +242,42 @@ def run():
     config.model.path =  str(finetuned_model_output_path)
 
     create_output_dirs(paths.output_dir)
-    
+
     PrefillPredictorConfig.to_json(config, usage_config_path)
+
+    # Ghi thêm usage_config_ov.json để model chạy được trên CPU qua OpenVINO
+    # backend (PrefillModelConfig.device="openvino"). Mutate sau khi save bản
+    # mặc định để không ảnh hưởng usage_config.json.
+    ov_config_path = os.path.join(paths.output_dir, "usage_config_ov.json")
+    config.model.device = "openvino"
+    config.model.num_threads = 32
+    config.model.inference_precision = "f16"
+    PrefillPredictorConfig.to_json(config, ov_config_path)
 
     predictor.model.config.__dict__['num_labels'] = config.model.num_labels
 
     predictor.model = predictor.model.half()
     predictor.model.save_pretrained(finetuned_model_output_path)
+
+    # [best-tau] Ghi metadata để debug overfit pattern post-hoc. So best_epoch
+    # vs last_epoch: nếu best_epoch << last_epoch → overfit confirmed, có thể
+    # tune args.epoch xuống cho run sau. tau_history dùng vẽ curve.
+    summary = {
+        "best_epoch": best_epoch,
+        "best_tau": float(best_tau),
+        "last_epoch": args.epoch,
+        "last_tau": tau_history[-1] if tau_history else None,
+        "total_epochs_run": len(tau_history),
+        "loss": args.loss,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "label_group_size": args.label_group_size,
+        "tau_history": tau_history,
+    }
+    summary_path = os.path.join(paths.output_dir, "training_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[summary] {summary_path}")
 
 
 if __name__ == "__main__":

@@ -185,3 +185,43 @@ hip_compat.h
 
 # Benchmark dataset
 *.json
+*.jsonl
+
+# Model weights / checkpoints
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+*.ckpt
+
+# Profiler / trace artifacts
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.trace.json
+*.nvprof
+
+# Generated experiment / result directories
+benchmarks/MODEL/
+benchmarks/BURST/
+benchmarks/DSR1Distill/
+benchmarks/Llama3-Trace/
+benchmarks/Qwen2.5/
+benchmarks/PRE_LAT_E2E/
+benchmarks/BENCH_PRED_RES/
+benchmarks/SERVE/
+benchmarks/SERVE_RES/
+benchmarks/SERVE_RESS/
+benchmarks/SER_RES_ASYNC_MERGE/
+benchmarks/SYSTEM_PROBE/
+benchmarks/TEMP_PROF_R8/
+benchmarks/TEMP_PROF_R8_C1_NSIGHT/
+benchmarks/TEMP_PROF_R8_DT/
+benchmarks/TEMP_PROF_R8_NSIGHT/
+benchmarks/TEMP_RES_ASYNC/
+benchmarks/server_trace/
+benchmarks/server_tracee/
+benchmarks/server_tracee_ov/
+Llama3-Trace/

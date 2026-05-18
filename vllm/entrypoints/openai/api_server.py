@@ -34,6 +34,11 @@ logger = init_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
 
+    # ── NEW: start profiler if requested ────────────────────────────────────  
+    if args.profile_dir:  
+        engine.engine.init_profiler(args.profile_dir)  
+    # ────────────────────────────────────────────────────────────────────────  
+
     async def _force_log():
         while True:
             await asyncio.sleep(10)
@@ -50,6 +55,12 @@ app = fastapi.FastAPI(lifespan=lifespan)
 
 def parse_args():
     parser = make_arg_parser()
+    parser.add_argument(  
+        "--profile-dir",  
+        type=str,  
+        default=None,  
+        help="If set, save torch profiler trace to this directory.",  
+    )  
     return parser.parse_args()
 
 

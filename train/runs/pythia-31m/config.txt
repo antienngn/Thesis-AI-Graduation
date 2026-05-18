@@ -1,0 +1,10 @@
+{
+  "model": {
+    "pred_model": "EleutherAI/pythia-31m-deduped",
+    "num_labels": 1,
+    "mtype": "rank",
+    "activation": null,
+    "max_length": 2048,
+    "max_batch_size": 1000
+  }
+}

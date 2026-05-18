@@ -1,0 +1,3 @@
+# python measure_predictor_latency_cpu.py --dataset llama3-8b-sharegpt-test-t1-s0-8192.jsonl --num-prompts 256 --batch-size 32 --threads 8 --repeat-iters 20
+
+python measure_predictor_latency_gpu.py --usage-config MODEL/results/opt-125m-llama3-8b-sharegpt-score-trainbucket10-b32/usage_config.json --dataset llama3-8b-sharegpt-test-t1-s0-8192.jsonl --num-prompts 256 --batch-size 32 --num-iters 10 --output predictor_latency_gpu.pt

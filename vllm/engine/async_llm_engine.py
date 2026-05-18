@@ -17,6 +17,8 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import MultiModalData
 from vllm.usage.usage_lib import UsageContext
+import torch
+
 
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = int(
@@ -196,6 +198,30 @@ class RequestTracker:
 class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
 
+    # ── NEW: profiler state ──────────────────────────────────────────────────  
+    def init_profiler(self, profile_dir: str):  
+        """Call once after engine creation to enable server-side profiling."""  
+        self._prof_dir = profile_dir  
+        self._prof_step = 0  
+        self._profiler = torch.profiler.profile(  
+            activities=[  
+                torch.profiler.ProfilerActivity.CPU,  
+                torch.profiler.ProfilerActivity.CUDA,  
+            ],  
+            schedule=torch.profiler.schedule(  
+                wait=90,      # skip first 10 steps (cold start)  
+                warmup=5,     # warm up profiler for 5 steps  
+                active=60,    # record 50 steps  
+                repeat=1,     # stop after one cycle  
+            ),  
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),  
+            record_shapes=True,  
+            with_stack=True,  
+        )  
+        self._profiler.start()  
+        print(f"[SERVER PROFILER] Started. Trace will be saved to: {profile_dir}")  
+    # ─────────────────────────────────────────────────────────────────────────  
+
     async def step_async(self) -> List[RequestOutput]:
         """Performs one decoding iteration and returns newly generated results.
         The workers are ran asynchronously if possible.
@@ -206,20 +232,59 @@ class _AsyncLLMEngine(LLMEngine):
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
-        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        # ── NEW: profiler step ───────────────────────────────────────────────  
+        if hasattr(self, '_profiler'):  
+            self._profiler.step()  
+            self._prof_step += 1  
+            if self._prof_step == 155:   # wait(90) + warmup(5) + active(60)  
+                self._profiler.stop()  
+                print(f"[SERVER PROFILER] Trace saved to: {self._prof_dir}")  
+        # ────────────────────────────────────────────────────────────────────  
+        with torch.profiler.record_function("scheduler.schedule"):  
+            seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
         if not scheduler_outputs.is_empty():
+            # [TRACE_EVENTS] model_executor.start/end (GPU forward proxy)
+            from vllm import event_tracer
+            import time as _time
+            _trace_t0 = _time.time() if event_tracer.is_enabled() else None
+            if _trace_t0 is not None:
+                ssgs = scheduler_outputs.scheduled_seq_groups
+                plens, dlens = [], []
+                for ssg in ssgs:
+                    sg = ssg.seq_group
+                    seq = sg.get_seqs()[0]
+                    if sg.is_prefill():
+                        plens.append(seq.get_prompt_len())
+                    else:
+                        dlens.append(seq.get_len())
+                event_tracer.log("model_executor.start", {
+                    "n_seqs": len(ssgs),
+                    "n_tokens": scheduler_outputs.num_batched_tokens,
+                    "n_prefill": len(plens),
+                    "n_decode": len(dlens),
+                    "plen_max": max(plens) if plens else 0,
+                    "plen_sum": sum(plens) if plens else 0,
+                    "dlen_max": max(dlens) if dlens else 0,
+                    "dlen_mean": int(sum(dlens)/len(dlens)) if dlens else 0,
+                })
             # Execute the model.
-            output = await self.model_executor.execute_model_async(
-                seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,
-                scheduler_outputs.blocks_to_swap_out,
-                scheduler_outputs.blocks_to_copy)
+            with torch.profiler.record_function("model_executor.execute_model"):
+                output = await self.model_executor.execute_model_async(
+                    seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,
+                    scheduler_outputs.blocks_to_swap_out,
+                    scheduler_outputs.blocks_to_copy)
+            if _trace_t0 is not None:
+                event_tracer.log("model_executor.end", {
+                    "n_seqs": len(scheduler_outputs.scheduled_seq_groups),
+                    "lat_ms": (_time.time() - _trace_t0) * 1000.0,
+                })
         else:
             output = []
-
-        request_outputs = self._process_model_outputs(
-            output, scheduler_outputs.scheduled_seq_groups,
-            scheduler_outputs.ignored_seq_groups)
+        with torch.profiler.record_function("process_model_outputs"): 
+            request_outputs = self._process_model_outputs(
+                output, scheduler_outputs.scheduled_seq_groups,
+                scheduler_outputs.ignored_seq_groups)
 
         # Log stats.
         if self.log_stats:

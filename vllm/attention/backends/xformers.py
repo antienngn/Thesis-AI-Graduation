@@ -17,6 +17,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+    from vllm.attention.ops.prefix_prefill_xformers import (
+        context_attention_fwd as _xformers_context_attention_fwd)
+    _USE_XFORMERS_PREFIX_PREFILL = True
+    logger.info("Volta GPU detected ...")
+else:
+    _USE_XFORMERS_PREFIX_PREFILL = False  
+
 
 class XFormersBackend(AttentionBackend):
 
@@ -218,7 +226,6 @@ class XFormersImpl(AttentionImpl):
 
         assert query.shape[0] == num_prefill_tokens
         assert decode_query.shape[0] == num_decode_tokens
-
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
             if kv_cache is None or prefill_meta.block_tables.numel() == 0:
@@ -234,21 +241,34 @@ class XFormersImpl(AttentionImpl):
                 # TODO(Hai) this triton kernel has regression issue (broke) to
                 # deal with different data types between KV and FP8 KV cache,
                 # to be addressed separately.
-                out = PagedAttention.forward_prefix(
-                    query,
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    prefill_meta.block_tables,
-                    prefill_meta.subquery_start_loc,
-                    prefill_meta.prompt_lens_tensor,
-                    prefill_meta.context_lens,
-                    prefill_meta.max_subquery_len,
-                    self.alibi_slopes,
-                )
-                assert output[:num_prefill_tokens].shape == out.shape
-                output[:num_prefill_tokens] = out
+                if _USE_XFORMERS_PREFIX_PREFILL:
+                    out = torch.empty_like(query)
+                    _xformers_context_attention_fwd(
+                        query, key, value, out,
+                        key_cache, value_cache,
+                        prefill_meta.block_tables,
+                        prefill_meta.subquery_start_loc[:-1],  
+                        prefill_meta.prompt_lens_tensor,       
+                        prefill_meta.context_lens,              
+                        prefill_meta.max_subquery_len,
+                        self.alibi_slopes,
+                    )
+                else:
+                    out = PagedAttention.forward_prefix(
+                        query,
+                        key,
+                        value,
+                        key_cache,
+                        value_cache,
+                        prefill_meta.block_tables,
+                        prefill_meta.subquery_start_loc,
+                        prefill_meta.prompt_lens_tensor,
+                        prefill_meta.context_lens,
+                        prefill_meta.max_subquery_len,
+                        self.alibi_slopes,
+                    )
+                    assert output[:num_prefill_tokens].shape == out.shape
+                    output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
             output[num_prefill_tokens:] = PagedAttention.forward_decode(

@@ -125,6 +125,10 @@ async def async_request_vllm(
             "top_p": 1.0,
             "ignore_eos": request_func_input.ignore_eos,
             "est_tokens": request_func_input.est_tokens,
+            # Deterministic sampling: cùng prompt + cùng seed → cùng output.
+            # Giữ temperature=1.0/top_p=1.0 để preserve realistic distribution
+            # (vs greedy temperature=0 sẽ shift output_len distribution).
+            "seed": 42,
         }
         headers = {
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"

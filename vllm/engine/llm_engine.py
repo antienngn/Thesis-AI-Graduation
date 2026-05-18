@@ -223,21 +223,47 @@ class LLMEngine:
             ))
         print('Prefill Pred: ', self.model_config.prefill_predictor_model_config)
         if self.model_config.prefill_predictor_model_config:
-            print('aux llm config: ', self.model_config.prefill_predictor_model_config, "len: ", self.model_config.prefill_predictor_model_config.model.max_length)
-            from vllm import AUXLLM
-            self.scheduler.aux_model = AUXLLM(
-                model=self.model_config.prefill_predictor_model_config.model.path,
-                tokenizer=self.model_config.prefill_predictor_model_config.model.pred_model,
-                swap_space=0,
-                gpu_memory_utilization=0.0,
-                enforce_eager=True,
-                schedule_type='fcfs',
-                enable_chunked_prefill=False,
-                max_model_len=self.model_config.prefill_predictor_model_config.model.max_length,
-                tensor_parallel_size=self.parallel_config.tensor_parallel_size,
-                placement_group=self.parallel_config.placement_group,
-                llm_model_executor=self.model_executor,
-            )
+            # === [opt-cpu] Factory branching for predictor backend ===
+            # cfg.device chọn giữa 2 backend:
+            #   - "openvino": chạy CPU qua OpenVINO (bypass AUXLLM/AUXLLMEngine).
+            #     Latency được "che" bởi GPU work song song → không tranh GPU
+            #     với main LLM (Llama-3-8B/70B).
+            #   - "auto" (default): giữ flow cũ → AUXLLM trên GPU.
+            cfg = self.model_config.prefill_predictor_model_config.model
+            print('aux predictor setting:', cfg.device, 'len:', cfg.max_length)
+
+            if cfg.device == "openvino":
+                # CPU path: KHÔNG init AUXLLMEngine. OpenVINOPredictor chỉ
+                # implement obtain_aux_scores() đủ cho scheduler ranking gọi tới.
+                from vllm.model_executor.openvino_predictor import (
+                    OpenVINOPredictor,
+                )
+                self.scheduler.aux_model = OpenVINOPredictor(
+                    model_path=cfg.path,
+                    tokenizer_name=cfg.pred_model,
+                    num_labels=cfg.num_labels,
+                    max_length=cfg.max_length,
+                    max_batch_size=cfg.max_batch_size,
+                    num_threads=cfg.num_threads,
+                    inference_precision=cfg.inference_precision,
+                )
+            else:
+                # GPU path (legacy/baseline): giữ nguyên AUXLLM init.
+                from vllm import AUXLLM
+                self.scheduler.aux_model = AUXLLM(
+                    model=cfg.path,
+                    tokenizer=cfg.pred_model,
+                    swap_space=0,
+                    gpu_memory_utilization=0.0,
+                    enforce_eager=True,
+                    schedule_type='fcfs',
+                    enable_chunked_prefill=False,
+                    max_model_len=cfg.max_length,
+                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                    placement_group=self.parallel_config.placement_group,
+                    llm_model_executor=self.model_executor,
+                )
+            # === [opt-cpu] END ===
         else:
             self.scheduler.aux_model = None
 

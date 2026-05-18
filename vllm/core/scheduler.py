@@ -1,4 +1,5 @@
 import enum, os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -268,6 +269,41 @@ class Scheduler:
         self.schedule_type = scheduler_config.schedule_type
         self.tbound = -1
         self.starv = -1
+        # === [opt-cpu] BEGIN: warmup state ===
+        # warmup_seconds: số giây áp dụng FCFS từ lúc scheduler nhận request đầu.
+        #   Parse từ schedule_type qua regex (warmup|merged)(\d+\.?\d*). Vd:
+        #     "opt-cpu-warmup2.0"          -> 2.0
+        #     "opt-cpu-warmup0.5"          -> 0.5
+        #     "opt-cpu-warmup0"            -> 0.0 (= không warmup, ranking ngay)
+        #     "opt-cpu-async-warmup1.0"    -> 1.0
+        #     "opt-cpu-async-merged1.0"    -> 1.0  ← merged variant
+        #     "opt-cpu-async-merged0.5"    -> 0.5  ← T sweep
+        #     "opt-xxx" (không match)      -> 0.0 (default, không ảnh hưởng baseline)
+        # Lý do regex match cả "warmup" lẫn "merged": variant 'opt-cpu-async-merged'
+        # (xem _get_opt_cpu_async_merged_ordered_requests) dùng prefix 'merged' thay
+        # 'warmup' nhưng vẫn parse cùng cơ chế T value. Trước đây regex chỉ match
+        # 'warmup' → merged variant fallback về warmup_seconds=0.0 → fall-through
+        # tới line `serve_start_time + warmup_seconds` crash với None + 0.0.
+        # serve_start_time: mốc thời gian được set lazy ở Scheduler.add_seq_group
+        #   khi request ĐẦU TIÊN đến scheduler (Edit B2-bis). Lý do dùng
+        #   add_seq_group thay vì arrival_time của LLMEngine: muốn đo "GPU đã
+        #   được scheduler đẩy việc" — sau tokenize, không tính thời gian
+        #   tokenize/request creation. Lệch ~5-50ms so với arrival_time.
+        self.warmup_seconds = 0.0
+        self.serve_start_time = None
+        m = re.search(r"(?:warmup|merged)(\d+\.?\d*)", self.schedule_type)
+        if m:
+            self.warmup_seconds = float(m.group(1))
+            print(f"FCFS warmup: {self.warmup_seconds}s")
+        # === [opt-cpu] END ===
+
+        # === [TRACE_EVENTS] Init event tracer ===
+        # Gate bằng env TRACE_EVENTS=1 + TRACE_EVENTS_PATH=...
+        # Off mặc định → zero overhead.
+        from vllm import event_tracer
+        event_tracer.init()
+        self._tick_idx = 0  # counter cho scheduler.tick events
+        # === [TRACE_EVENTS] END ===
         if "starv" in self.schedule_type:
             self.starv = int(self.schedule_type[self.schedule_type.find("starv") +
                                    len("starv"):self.schedule_type.find("period") - 1])
@@ -322,6 +358,50 @@ class Scheduler:
             self._get_ordered_requests = self._get_tpt_ordered_requests
             self._update_priority = self._update_tpt_priority
             self.need_score = True
+        # === [opt-cpu-async-merged] BEGIN: dispatch — phải đặt TRƯỚC ===
+        # Vì "opt-cpu-async-merged1.0".startswith("opt-cpu-async") cũng True,
+        # nên branch này phải xếp TRƯỚC nhánh "opt-cpu-async". Cùng pattern
+        # startswith ordering đã làm cho "opt-cpu-async" vs "opt-cpu".
+        #
+        # Naming: opt-cpu-async-merged<T> — variant của opt-cpu-async-warmup<T>
+        # nhưng BỎ Stage 2 quarantine. Sau warmup_seconds, post-warmup scored
+        # được phép vào schedulable cùng warmup-era đang drain (không còn
+        # "wall" 15-20s như async-warmup). Predictor logic (streaming API,
+        # eager score, no fallback score=0) GIỮ NGUYÊN.
+        # Xem _get_opt_cpu_async_merged_ordered_requests để hiểu logic.
+        elif self.schedule_type.startswith("opt-cpu-async-merged"):
+            self._schedule = self._general_schedule
+            self._get_ordered_requests = (
+                self._get_opt_cpu_async_merged_ordered_requests
+            )
+            self._update_priority = self._update_opt_priority
+            self.need_score = True
+        # === [opt-cpu-async-merged] END ===
+        # === [opt-cpu-async] BEGIN: dispatch — phải đặt TRƯỚC "opt-cpu" ===
+        # Vì "opt-cpu-async-warmup2.0".startswith("opt-cpu") cũng đúng,
+        # nên nếu để sau sẽ rơi vào _get_opt_cpu_ordered_requests (legacy, sai).
+        # Naming: opt-cpu-async-warmup<T> — async qua streaming predictor API
+        # (continuous queue) + 3-phase scheduler (warmup/drain/post-drain).
+        # Xem _get_opt_cpu_async_warmup_ordered_requests để hiểu logic.
+        elif self.schedule_type.startswith("opt-cpu-async"):
+            self._schedule = self._general_schedule
+            self._get_ordered_requests = (
+                self._get_opt_cpu_async_warmup_ordered_requests
+            )
+            self._update_priority = self._update_opt_priority
+            self.need_score = True
+        # === [opt-cpu-async] END ===
+        # === [opt-cpu] BEGIN: dispatch branch — phải đặt TRƯỚC "opt" ===
+        # Vì "opt-cpu-warmup2.0".startswith("opt") cũng đúng, nên nếu để sau
+        # nhánh opt sẽ rơi vào _get_opt_ordered_requests cũ (sai).
+        # _update_opt_priority được reuse vì hiện tại nó chỉ là `pass` stub
+        # và logic priority không khác giữa opt và opt-cpu.
+        elif self.schedule_type.startswith("opt-cpu"):
+            self._schedule = self._general_schedule
+            self._get_ordered_requests = self._get_opt_cpu_ordered_requests
+            self._update_priority = self._update_opt_priority
+            self.need_score = True
+        # === [opt-cpu] END ===
         elif self.schedule_type.startswith("opt"):
             self._schedule = self._general_schedule
             self._get_ordered_requests = self._get_opt_ordered_requests
@@ -366,13 +446,43 @@ class Scheduler:
         return 1
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
+        # === [opt-cpu] BEGIN: warmup mốc capture ===
+        # Capture mốc warmup ngay khi scheduler nhận request ĐẦU TIÊN.
+        # Đây là Option 3 (đã chốt với user): mốc = lúc add_seq_group được gọi
+        # lần đầu, KHÔNG phải arrival_time của LLMEngine (Option 2).
+        # Lý do: muốn đo "GPU đã được scheduler đẩy việc" — sau tokenize, không
+        # tính thời gian tokenize. Lệch ~5-50ms so với arrival_time.
+        # Guard `warmup_seconds > 0` đảm bảo schedule_type khác (fcfs, opt-xxx,
+        # sjf, ...) zero overhead khi tracing tắt. Khi TRACE_EVENTS=1, vẫn set
+        # mốc serve_start cho mọi schedule_type để event_tracer.is_enabled() trả
+        # True và events được flush (opt-xxx trước đây tạo trace rỗng vì miss
+        # nhánh này).
+        _tracing_requested = bool(int(os.environ.get('TRACE_EVENTS', 0)))
+        if self.serve_start_time is None and (
+            self.warmup_seconds > 0 or _tracing_requested
+        ):
+            self.serve_start_time = time.time()
+            from vllm import event_tracer
+            event_tracer.set_serve_start(self.serve_start_time)
+        # === [opt-cpu] END ===
+
         # Add sequence groups to the waiting queue.
         logger.debug(f"add_seq_group {seq_group.request_id}")
         self.waiting.append(seq_group)
         seq_group.idle = 0
         seq_group.runs = 0
         seq_group.pri = 0
-        
+
+        # [TRACE_EVENTS] log request arrival
+        from vllm import event_tracer
+        if event_tracer.is_enabled():
+            # prompt_len ước lượng từ first seq trong group
+            first_seq = next(iter(seq_group.seqs_dict.values()))
+            prompt_len = len(first_seq.prompt_token_ids) if hasattr(first_seq, 'prompt_token_ids') else -1
+            event_tracer.log("request.arrival", {
+                "rid": seq_group.request_id,
+                "prompt_len": prompt_len,
+            })
         #if self.schedule_type.startswith("opt"):
         #    print('[arrival] ', seq_group.request_id)
 
@@ -973,13 +1083,28 @@ class Scheduler:
             if r.need_aux_model_score():
                 need_aux_scores.append(r)
 
-        if need_aux_scores: 
+        if need_aux_scores:
+            # [TRACE_EVENTS] predictor.submit (sync mode, BLOCK scheduler tick)
+            from vllm import event_tracer
+            _trace_t0 = time.time() if event_tracer.is_enabled() else None
+            if _trace_t0 is not None:
+                event_tracer.log("predictor.submit.start", {
+                    "mode": "sync", "n_input": len(need_aux_scores),
+                })
             if int(os.environ.get('OPT_TIME', 0)):
                 t0 = time.time()
             self.aux_model.obtain_aux_scores(need_aux_scores)
             if int(os.environ.get('OPT_TIME', 0)):
-                t1 = time.time()       
-                print("OPT-TIME: ", t1 - t0)
+                # Format consistent với OV-PRED-TIME / OV-STREAM-TIME
+                # để parser predictor_latency dùng chung regex.
+                # n = batch size (số request được score 1 lần gọi).
+                print(f"OPT-TIME: n={len(need_aux_scores)} "
+                      f"t={time.time() - t0:.4f}s")
+            if _trace_t0 is not None:
+                event_tracer.log("predictor.submit.end", {
+                    "mode": "sync", "n_input": len(need_aux_scores),
+                    "lat_ms": (time.time() - _trace_t0) * 1000.0,
+                })
         
         if self.starv != -1:
             for r in list(self.waiting) + list(self.running) + list(self.swapped):
@@ -1001,6 +1126,704 @@ class Scheduler:
 
     def _update_opt_priority(self):
         pass
+
+    # === [opt-cpu] BEGIN ===
+    def _get_opt_cpu_ordered_requests(self):
+        """Variant của _get_opt_ordered_requests cho schedule_type 'opt-cpu-*'.
+
+        Khác biệt duy nhất so với _get_opt_ordered_requests: thêm FCFS warmup
+        phase ở đầu — trong T_warmup giây đầu (sau khi scheduler nhận request
+        đầu tiên), bypass aux_model và sort theo arrival_time. Sau warmup,
+        gọi aux_model.obtain_aux_scores (CPU OpenVINO) như ranking thường.
+
+        Self.serve_start_time được set ở Scheduler.add_seq_group (Edit B2-bis),
+        KHÔNG init ở đây.
+
+        Tại sao tách hàm riêng (KHÔNG sửa _get_opt_ordered_requests):
+        baseline 'opt-xxx' phải giữ 100% bất biến để bench so sánh sau này.
+        """
+        # === Warmup phase: FCFS, bypass predictor ===
+        elapsed = (
+            0.0 if self.serve_start_time is None
+            else time.time() - self.serve_start_time
+        )
+        if elapsed < self.warmup_seconds:
+            # Sort theo arrival_time (FCFS) — không gọi obtain_aux_scores.
+            return list(sorted(
+                list(self.waiting) + list(self.running) + list(self.swapped),
+                key=lambda req: req.metrics.arrival_time
+            ))
+
+        # === Ranking phase: ASYNC predictor (D1+D2) ===
+        # Pattern non-blocking 3 bước, mỗi bước ~µs (KHÔNG block event loop):
+        #
+        #   1. poll_results(): nếu Future từ tick trước đã done, đọc scores
+        #      và set vào aux_model_score của các seq_group đã submit.
+        #      Trả về 0 nếu chưa done — caller không quan tâm, sort sẽ dùng
+        #      _safe_neg_score (None → 0.0) cho các sg chưa có score.
+        #
+        #   2. Tìm waiting chưa scored — chỉ submit batch mới nếu có nhu cầu
+        #      VÀ predictor đang rảnh (is_busy=False). Nếu predictor đang
+        #      busy với batch trước, skip — score sẽ về sau khi tick này
+        #      xong, lúc đó tick sau sẽ submit batch tích lũy mới.
+        #
+        #   3. submit_async(): fire-and-forget. ThreadPoolExecutor pickup
+        #      batch và score trên worker thread. Event loop NGAY LẬP TỨC
+        #      tiếp tục → await execute_model_async() → GPU work.
+        #
+        # Lý do CHỈ score waiting (không score running/swapped):
+        #   - Khi exit warmup, running có thể chứa nhiều sg chưa score.
+        #     Submit hết một lúc → batch quá lớn → predictor latency tăng.
+        #   - Running đã đang được serve — score lại không thay đổi behavior.
+        #   - Sort dùng _safe_neg_score: running unscored treated như key=0.0,
+        #     không crash, không cần score.
+        self.aux_model.poll_results()  # ~µs, non-blocking
+
+        need_aux_scores = []
+        for r in self.waiting:
+            if r.need_aux_model_score():
+                need_aux_scores.append(r)
+
+        if need_aux_scores and not self.aux_model.is_busy():
+            if int(os.environ.get('OPT_TIME', 0)):
+                t0 = time.time()
+            # submit_async returns True nếu submit OK, False nếu busy.
+            # Đã guard not is_busy() ở trên nên thường True; double-check
+            # phòng race với poll_results.
+            submitted = self.aux_model.submit_async(need_aux_scores)
+            if int(os.environ.get('OPT_TIME', 0)):
+                print(f"OPT-CPU-SUBMIT: n={len(need_aux_scores)} "
+                      f"ok={submitted} t={time.time() - t0:.4f}s")
+
+        # Sort key None-safe: running/swapped được promote từ warmup phase
+        # mà chưa được predictor score (aux_model_score=None). Treat None
+        # như 0.0 (neutral) để không crash với `-None` và để các request có
+        # score thật vẫn được sort đúng vị trí.
+        def _safe_neg_score(req):
+            score = req.aux_model_score
+            return -score if score is not None else 0.0
+
+        # Logic starvation control giống hệt _get_opt_ordered_requests
+        # (giữ nguyên để có thể combine với schedule_type 'opt-cpu-warmup2.0-starv5period10').
+        if self.starv != -1:
+            for r in list(self.waiting) + list(self.running) + list(self.swapped):
+                if r.idle >= self.starv:
+                    r.pri = -1
+                    r.idle = 0
+                    r.runs = self.period
+                elif r.pri == -1 and r.runs <= 0:
+                    r.pri = 0
+            ret = list(sorted(
+                list(self.waiting) + list(self.running) + list(self.swapped),
+                key=lambda req: (req.pri, _safe_neg_score(req))
+            ))
+        else:
+            ret = list(sorted(
+                list(self.waiting) + list(self.running) + list(self.swapped),
+                key=_safe_neg_score
+            ))
+        return ret
+    # === [opt-cpu] END ===
+
+    # === [opt-cpu-async] BEGIN ===
+    def _get_opt_cpu_async_warmup_ordered_requests(self):
+        """opt-cpu-async-warmup<T>: 3-phase scheduler với streaming predictor.
+
+        Conditions enforce:
+          C1: 100% post-warmup requests scored TRƯỚC khi đưa vào model
+              execution. Gate filter unscored từ schedulable.
+          C2: Warmup-era requests (arrival_time < warmup_end) drain qua FCFS,
+              sequential strict trước predictor sort. Stage 2 BLOCK
+              post-warmup hoàn toàn (kể cả đã có score).
+
+        3 stages tự động transition qua arrival_time + queue state:
+
+          Stage 1 (Warmup, t < T):
+            - Sort all requests by arrival_time (FCFS)
+            - KHÔNG gọi predictor — request scored sau khi warmup end
+
+          Stage 2 (Drain, t >= T, còn warmup-era ở queues):
+            - Schedulable = running + swapped + waiting warmup-era only
+            - Sort by arrival_time (warmup-era priority tự nhiên do arrived
+              sớm hơn post-warmup)
+            - Predictor EAGER score post-warmup waiting (background, parallel
+              với GPU drain). Score available sẵn cho Stage 3.
+            - Post-warmup waiting BLOCKED khỏi schedulable
+
+          Stage 3 (Post-drain, không còn warmup-era):
+            - Schedulable = running + swapped + scored waiting
+            - Sort by predictor score (-aux_model_score)
+            - Gate unscored waiting (defensive — chặn miss case predictor
+              chưa kịp score)
+            - Assert invariant: schedulable không có None
+
+        Predictor mechanism (streaming API):
+          - submit_streaming always accepts (dedup nội bộ qua _stream_in_flight)
+          - poll_streaming no-op (worker apply scores trực tiếp cross-thread)
+          - State riêng biệt với legacy submit_async — zero impact
+            lên opt-cpu-warmup baseline.
+
+        Detect Stage qua arrival_time check:
+          - is_warmup_era(req): req.metrics.arrival_time < warmup_end
+          - warmup_end = serve_start_time + warmup_seconds
+          - Stage 2 vs 3: any warmup-era trong waiting+running+swapped
+        """
+        elapsed = (
+            0.0 if self.serve_start_time is None
+            else time.time() - self.serve_start_time
+        )
+
+        # === Stage 1: Warmup phase ===
+        # Sort theo arrival_time, không gọi predictor (request sẽ được score
+        # sau khi exit warmup, khi cần predictor sort)
+        if elapsed < self.warmup_seconds:
+            # [PROFILE] Log tick state với stage=1 (gate by OPT_PROFILE_TICK=1)
+            self._profile_tick_async_warmup(stage=1, elapsed=elapsed)
+            return list(sorted(
+                list(self.waiting) + list(self.running) + list(self.swapped),
+                key=lambda req: req.metrics.arrival_time
+            ))
+
+        # === Stage 2/3 setup ===
+        # Mốc phân biệt warmup-era vs post-warmup
+        warmup_end = self.serve_start_time + self.warmup_seconds
+
+        def is_warmup_era(req):
+            """Request thuộc warmup phase nếu arrived TRƯỚC warmup_end.
+
+            Lưu ý: req.metrics.arrival_time là vLLM default field, set ở
+            LLMEngine.add_request (trước khi vào scheduler). Cùng cơ chế
+            FCFS default của vLLM dùng.
+            """
+            return req.metrics.arrival_time < warmup_end
+
+        # === Predictor management — STREAMING API ===
+        # poll_streaming là no-op trong continuous queue model (worker đã
+        # apply scores cross-thread), giữ call cho API parity / future ext.
+        self.aux_model.poll_streaming()
+
+        # CHỈ score post-warmup waiting:
+        # - Warmup-era không cần score (per C2 — drain qua FCFS arrival_time)
+        # - Post-warmup waiting unscored → submit để eventually score
+        need_aux_scores = [
+            r for r in self.waiting
+            if not is_warmup_era(r) and r.need_aux_model_score()
+        ]
+        if need_aux_scores:
+            if int(os.environ.get('OPT_TIME', 0)):
+                t0 = time.time()
+            # submit_streaming always accepts (dedup nội bộ).
+            # Có thể call mỗi tick mà không sợ duplicate — predictor tự lọc
+            # qua _stream_in_flight set.
+            new_added = self.aux_model.submit_streaming(need_aux_scores)
+            if int(os.environ.get('OPT_TIME', 0)):
+                print(f"OPT-CPU-ASYNC-SUBMIT: n={len(need_aux_scores)} "
+                      f"new={new_added} t={time.time() - t0:.4f}s")
+
+        # === Detect Stage 2 vs Stage 3 ===
+        # Stage 2 nếu CÒN warmup-era ở bất kỳ queue nào.
+        # Stage 3 khi tất cả warmup-era đã rời queues (decoded to EOS hoặc
+        # max_tokens, removed via free_finished_seq_groups).
+        all_requests = (list(self.waiting) + list(self.running)
+                        + list(self.swapped))
+        warmup_era_remaining = any(is_warmup_era(r) for r in all_requests)
+
+        # [PROFILE] Log tick state với stage 2 hoặc 3 (gate by OPT_PROFILE_TICK=1).
+        # Đặt TRƯỚC stage branch để bắt được cả 2 paths qua 1 call site.
+        self._profile_tick_async_warmup(
+            stage=(2 if warmup_era_remaining else 3),
+            elapsed=elapsed,
+        )
+
+        if warmup_era_remaining:
+            # === Stage 2: Drain — pick CHỈ warmup-era ===
+            # Schedulable build:
+            #   - running + swapped: tất cả (đã pick rồi, đều warmup-era do
+            #     Stage 1+2 chỉ pick warmup-era; swapped warmup-era cũng OK)
+            #   - waiting: chỉ warmup-era qua filter
+            #     Post-warmup waiting BLOCKED hoàn toàn — kể cả đã có score
+            #     từ predictor eager. Đây là enforce C2 sequential strict.
+            schedulable = (
+                list(self.running)
+                + list(self.swapped)
+                + [r for r in self.waiting if is_warmup_era(r)]
+            )
+            return list(sorted(
+                schedulable, key=lambda r: r.metrics.arrival_time
+            ))
+
+        # === Stage 3: Post-drain — sort by predictor score ===
+        # Schedulable build với gate:
+        #   - running + swapped: tại Stage 3, warmup-era đã hết → đều là
+        #     post-warmup. Post-warmup chỉ vào running qua gate (đã scored).
+        #     → mọi running/swapped đều đã có score.
+        #   - waiting: gate filter chỉ scored qua. Unscored waiting (predictor
+        #     chưa kịp score) BLOCKED — đợi tick sau khi worker pump xong.
+        schedulable = (
+            list(self.running)
+            + list(self.swapped)
+            + [r for r in self.waiting if r.aux_model_score is not None]
+        )
+
+        # Defensive: invariant Stage 3 schedulable KHÔNG có None.
+        # Bug nếu invariant break → fail-fast với assert thay vì silent
+        # fallback (như _safe_neg_score của legacy). Catch logic bug sớm.
+        assert all(r.aux_model_score is not None for r in schedulable), \
+            ("Stage 3 invariant violated: schedulable contains unscored "
+             "request. Possible cause: warmup-era leak vào running/swapped "
+             "với score=None, hoặc gate filter không hoạt động đúng.")
+
+        # Sort by -score (ascending = highest score first = SJF approximate)
+        # Predictor trained để output score cao = job ngắn → -score asc =
+        # short job first.
+        if self.starv != -1:
+            # Starvation control: promote request idle quá lâu lên priority
+            # cao hơn (giống logic _get_opt_ordered_requests baseline).
+            for r in schedulable:
+                if r.idle >= self.starv:
+                    r.pri = -1
+                    r.idle = 0
+                    r.runs = self.period
+                elif r.pri == -1 and r.runs <= 0:
+                    r.pri = 0
+            return list(sorted(
+                schedulable,
+                key=lambda r: (r.pri, -r.aux_model_score)
+            ))
+
+        return list(sorted(
+            schedulable, key=lambda r: -r.aux_model_score
+        ))
+    # === [opt-cpu-async] END ===
+
+    # =========================================================================
+    # [opt-cpu-async-merged] BEGIN
+    # =========================================================================
+    # Variant của _get_opt_cpu_async_warmup_ordered_requests, BỎ Stage 2
+    # quarantine. Stage 2/3 collapsed thành 1 phase merged.
+    #
+    # Vấn đề mà variant này giải quyết (đo từ profile r=8 và r=16):
+    #   async-warmup cũ: Stage 2 dwell 15.7-20.1s với KV trống 96-98%, có
+    #   ~50-170 post-warmup scored bị quarantine. Mean TTFT 31s/108s.
+    #   → Toàn bộ dwell time bị "lãng phí" thành tail TTFT.
+    #
+    # Cách fix: cho post-warmup scored vào schedulable ngay khi có score
+    # (không đợi warmup-era drain xong). Composite sort key đảm bảo
+    # warmup-era vẫn ưu tiên TUYỆT ĐỐI trong sort, nhưng KHÔNG quarantine.
+    # =========================================================================
+    def _get_opt_cpu_async_merged_ordered_requests(self):
+        """opt-cpu-async-merged<T>: 2-phase scheduler — bỏ Stage 2 quarantine.
+
+        Khác biệt chính so với opt-cpu-async-warmup<T>:
+          - Stage 2 (drain) và Stage 3 (post-drain) cũ → MERGED thành 1.
+          - Post-warmup scored được phép vào schedulable cùng warmup-era
+            (không còn block 15-20s như async-warmup).
+          - Composite sort key: warmup-era priority TUYỆT ĐỐI (tuple 0 < 1),
+            trong từng class dùng key riêng (FCFS cho warmup, SJF cho post).
+          - Eliminates Stage 2 dwell wall = full warmup-era decode time.
+
+        Predictor logic GIỮ NGUYÊN (zero impact):
+          - poll_streaming() no-op
+          - submit_streaming(post-warmup unscored) eager
+          - Unscored post-warmup VẪN bị gate (KHÔNG ép score=0 fallback) —
+            giữ đúng semantic baseline async-warmup.
+
+        2 stages:
+          Stage 1 (warmup, t < T):
+            FCFS by arrival_time, no predictor.
+          Stage 2 (merged post-warmup, t >= T):
+            schedulable = running + swapped
+                        + [w in waiting if is_warmup_era(w)]
+                        + [w in waiting if (not warmup_era)
+                                          and aux_score is not None]
+            sort_key = (0 if warmup_era else 1,         # warmup-era trước
+                        arrival_time if warmup_era       # warmup → FCFS
+                          else -aux_model_score)         # post → SJF
+            Invariant: mọi post-warmup trong schedulable có score (assert).
+
+        Naming convention: opt-cpu-async-merged<T> với T = warmup_seconds
+        (parse qua regex 'warmup(\\d+\\.?\\d*)' ở __init__ — cùng cơ chế
+        với opt-cpu-warmup<T> và opt-cpu-async-warmup<T>).
+        """
+        elapsed = (
+            0.0 if self.serve_start_time is None
+            else time.time() - self.serve_start_time
+        )
+
+        # === Stage 1: Warmup phase ===
+        # Sort theo arrival_time, không gọi predictor (giống Stage 1 của
+        # async-warmup cũ). Request sẽ được score sau khi exit warmup.
+        if elapsed < self.warmup_seconds:
+            # [PROFILE] Log tick state với stage=1 (gate by OPT_PROFILE_TICK=1).
+            self._profile_tick_async_merged(stage=1, elapsed=elapsed)
+            return list(sorted(
+                list(self.waiting) + list(self.running) + list(self.swapped),
+                key=lambda req: req.metrics.arrival_time
+            ))
+
+        # === Defensive guard: serve_start_time có thể None ===
+        # Edge case: schedule_type 'opt-cpu-async-merged0.0' (T=0, không warmup)
+        # → elapsed (0.0) < warmup_seconds (0.0) là False → fall-through. Nếu
+        # đồng thời chưa có request nào (serve_start_time vẫn None), line tính
+        # warmup_end sẽ crash None + 0.0. Trả empty list — scheduler sẽ idle
+        # tới khi request đầu tiên kích hoạt serve_start_time.
+        # Async-warmup cũ không cần guard này vì warmup_seconds luôn > 0 (qua
+        # tên schedule_type yêu cầu '<warmup|merged>X.X' với X > 0 thực tế).
+        if self.serve_start_time is None:
+            return []
+
+        # === Stage 2: Merged post-warmup phase ===
+        # Mốc phân biệt warmup-era vs post-warmup (giống async-warmup).
+        warmup_end = self.serve_start_time + self.warmup_seconds
+
+        def is_warmup_era(req):
+            """Request thuộc warmup-era nếu arrived TRƯỚC warmup_end.
+
+            arrival_time là vLLM default field, set ở LLMEngine.add_request
+            trước khi vào scheduler. Immutable trong suốt lifetime của
+            request → safe để dùng làm class label trong sort key.
+            """
+            return req.metrics.arrival_time < warmup_end
+
+        # === Predictor management — STREAMING API ===
+        # GIỮ NGUYÊN logic của async-warmup:
+        #   poll_streaming() no-op (worker apply scores cross-thread)
+        #   submit_streaming(post-warmup unscored) — dedup nội bộ, always accept
+        #   KHÔNG fallback score=0 — unscored sẽ bị gate ở schedulable filter.
+        self.aux_model.poll_streaming()
+
+        # Chỉ score post-warmup waiting (warmup-era không cần score —
+        # admit qua FCFS, không tham gia SJF sort).
+        need_aux_scores = [
+            r for r in self.waiting
+            if not is_warmup_era(r) and r.need_aux_model_score()
+        ]
+        if need_aux_scores:
+            # [TRACE_EVENTS] predictor.submit (stream mode, non-blocking)
+            from vllm import event_tracer
+            _trace_t0 = time.time() if event_tracer.is_enabled() else None
+            if _trace_t0 is not None:
+                event_tracer.log("predictor.submit.start", {
+                    "mode": "stream", "n_input": len(need_aux_scores),
+                })
+            if int(os.environ.get('OPT_TIME', 0)):
+                t0 = time.time()
+            new_added = self.aux_model.submit_streaming(need_aux_scores)
+            if int(os.environ.get('OPT_TIME', 0)):
+                # Prefix MERGED để phân biệt với OPT-CPU-ASYNC-SUBMIT của
+                # async-warmup cũ trong server log.
+                print(f"OPT-CPU-MERGED-SUBMIT: n={len(need_aux_scores)} "
+                      f"new={new_added} t={time.time() - t0:.4f}s")
+            if _trace_t0 is not None:
+                event_tracer.log("predictor.submit.end", {
+                    "mode": "stream", "n_new": new_added,
+                    "lat_ms": (time.time() - _trace_t0) * 1000.0,
+                })
+
+        # [PROFILE] Log tick state với stage=2.
+        # KHÔNG có stage=3 trong variant merged — collapsed vào stage=2.
+        self._profile_tick_async_merged(stage=2, elapsed=elapsed)
+
+        # === Build schedulable (CORE CHANGE — không quarantine) ===
+        # Khác async-warmup ở Stage 2:
+        #   async-warmup: chỉ warmup-era waiting → quarantine post-warmup
+        #   merged:       warmup-era waiting + post-warmup SCORED waiting
+        #
+        # Lưu ý running/swapped:
+        #   - Tại stage này có thể chứa CẢ warmup-era (chưa decode xong) VÀ
+        #     post-warmup (đã admit từ tick trước). Cả hai đều giữ trong
+        #     schedulable vì đã chiếm KV slot rồi.
+        #   - Post-warmup trong running PHẢI có score (vì lần đầu vào
+        #     running cũng qua filter này → có score). Invariant duy trì
+        #     across ticks.
+        #
+        # Waiting filter:
+        #   - is_warmup_era(w): luôn eligible (giống Stage 2 cũ).
+        #   - not warmup_era and score is not None: post-warmup scored
+        #     được phép vào (CORE CHANGE). Unscored bị gate.
+        schedulable = (
+            list(self.running)
+            + list(self.swapped)
+            + [w for w in self.waiting if is_warmup_era(w)]
+            + [w for w in self.waiting
+               if not is_warmup_era(w) and w.aux_model_score is not None]
+        )
+
+        # === Invariant assert (di chuyển từ Stage 3 cũ sang đây) ===
+        # Mọi post-warmup trong schedulable PHẢI có score:
+        #   - Waiting post-warmup: filter trên đã exclude unscored
+        #   - Running/swapped post-warmup: chỉ vào running qua filter này
+        #     ở tick trước → có score
+        #   - Warmup-era: skip check (không cần score)
+        # Fail-fast nếu invariant break (giống pattern Stage 3 assert cũ,
+        # giúp catch logic bug sớm thay vì silent wrong sort).
+        assert all(is_warmup_era(r) or r.aux_model_score is not None
+                   for r in schedulable), \
+            ("Merged invariant violated: post-warmup trong schedulable "
+             "không có score. Possible cause: predictor crash, race "
+             "condition giữa filter và sort, hoặc logic bug.")
+
+        # === Composite sort key ===
+        # Tuple (class_priority, in_class_key) đảm bảo:
+        #   - Warmup-era luôn đứng TRƯỚC post-warmup trong sort (0 < 1)
+        #     → giữ semantic "warmup-era ưu tiên" của design gốc.
+        #   - Trong từng class:
+        #       warmup-era: arrival_time (FCFS — giống Stage 2 cũ)
+        #       post-warmup: -aux_model_score (SJF — giống Stage 3 cũ)
+        # KHÔNG fallback score=0 cho post-warmup (sẽ crash AttributeError nếu
+        # invariant break — đó là intentional, fail-fast).
+        def _sort_key(r):
+            if is_warmup_era(r):
+                return (0, r.metrics.arrival_time)
+            return (1, -r.aux_model_score)
+
+        # === Starvation control (optional, qua schedule_type 'starvNperiodM') ===
+        # Chỉ apply cho post-warmup (warmup-era đã có priority cứng qua
+        # tuple key — không cần promote thêm).
+        # Combine với composite key:
+        #   warmup-era: (0, arrival_time) — không đổi
+        #   post-warmup: (1, pri, -score) — pri promote idle requests lên trước
+        if self.starv != -1:
+            for r in schedulable:
+                if is_warmup_era(r):
+                    continue  # warmup-era không cần starv
+                if r.idle >= self.starv:
+                    r.pri = -1
+                    r.idle = 0
+                    r.runs = self.period
+                elif r.pri == -1 and r.runs <= 0:
+                    r.pri = 0
+            return list(sorted(
+                schedulable,
+                key=lambda r: (
+                    (0, r.metrics.arrival_time) if is_warmup_era(r)
+                    else (1, getattr(r, 'pri', 0), -r.aux_model_score)
+                )
+            ))
+
+        return list(sorted(schedulable, key=_sort_key))
+    # === [opt-cpu-async-merged] END ===
+
+    # =========================================================================
+    # [PROFILE] Tick profiler — aggregated stats per scheduler tick
+    # =========================================================================
+    # Mục đích: trả lời câu hỏi "trong Stage 2, GPU có slot KV trống và
+    # post-warmup scored sẵn sàng admit không?". Data dùng để quyết định
+    # hướng cải tiến (nới C2 vs KV-aware policy).
+    #
+    # Schema CSV (1 row/tick):
+    #   t_rel:                   giây từ serve_start_time
+    #   stage:                   1 (warmup) / 2 (drain) / 3 (post-drain)
+    #   n_running, n_swapped, n_waiting:    queue sizes
+    #   n_warmup_era_running:    warmup-era còn ở running (đang decode)
+    #   n_warmup_era_waiting:    warmup-era còn ở waiting (Stage 2 ưu tiên)
+    #   n_postwarmup_waiting_scored:   POST-warmup CÓ score, đang BLOCKED bởi
+    #                                  Stage 2 quarantine. **Metric chính** —
+    #                                  cao = eager scoring đang work, fix nới
+    #                                  C2 sẽ thấy effect ngay.
+    #   n_postwarmup_waiting_unscored: predictor chưa kịp score (gate Stage 3)
+    #   n_free_gpu_blocks:       KV cache headroom. **Metric chính** — cao
+    #                            trong Stage 2 = có slot trống, nới C2 khả thi.
+    #   n_total_gpu_blocks:      mẫu số
+    #   stream_queue_depth, stream_in_flight: predictor backlog (dirty read)
+    #
+    # Gate bằng env OPT_PROFILE_TICK=1 (default off — zero impact production).
+    # Output path: env OPT_PROFILE_TICK_PATH (default /tmp/tick_profile_<pid>.csv).
+    #
+    # Overhead ~10-50µs/tick (chủ yếu loop sum is_warmup_era trên ~30 elements).
+    # Ở r=8 với ~50-80 tick/s → <0.5% overhead, dưới noise level.
+    # =========================================================================
+    def _profile_tick_async_warmup(self, stage: int, elapsed: float) -> None:
+        """[PROFILE] Append 1 row CSV mô tả state của tick hiện tại.
+
+        Lazy-init file handle ở first call. Header viết 1 lần. Không flush
+        per row — relying on Python io buffer (8KB), flush khi đầy hoặc khi
+        process exit. Nếu kill server giữa chừng, vài row cuối có thể mất —
+        chấp nhận cho aggregated profiling.
+
+        Args:
+            stage: 1 / 2 / 3 (caller xác định từ logic stage detection).
+            elapsed: time.time() - serve_start_time (đã tính sẵn ở caller,
+                pass vào để tránh tính 2 lần).
+        """
+        # Gate sớm — overhead khi off ~100ns (1 dict lookup + int compare).
+        if not int(os.environ.get('OPT_PROFILE_TICK', 0)):
+            return
+
+        # Defensive: nếu chưa có request nào (serve_start_time=None) thì
+        # warmup_end không tính được. Skip — không có gì để log.
+        if self.serve_start_time is None:
+            return
+
+        # Lazy init file handle ở first call. Lưu vào self để tái sử dụng.
+        if not hasattr(self, '_profile_tick_fh'):
+            path = os.environ.get(
+                'OPT_PROFILE_TICK_PATH',
+                f'/tmp/tick_profile_{os.getpid()}.csv'
+            )
+            # Tạo dir nếu cần (vd TEMP_RES_ASYNC/ chưa tồn tại).
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            # buffering=8192: io buffer 8KB, write nhanh, flush tự động.
+            self._profile_tick_fh = open(path, 'w', buffering=8192)
+            self._profile_tick_fh.write(
+                "t_rel,stage,n_running,n_swapped,n_waiting,"
+                "n_warmup_era_running,n_warmup_era_waiting,"
+                "n_postwarmup_waiting_scored,n_postwarmup_waiting_unscored,"
+                "n_free_gpu_blocks,n_total_gpu_blocks,"
+                "stream_queue_depth,stream_in_flight\n"
+            )
+            print(f"[PROFILE] Tick profile CSV: {path}")
+
+        # Inline is_warmup_era — không gọi closure để giảm overhead Python.
+        warmup_end = self.serve_start_time + self.warmup_seconds
+
+        # Đếm warmup-era / post-warmup splits.
+        # Loop 2 lần qua waiting (1 cho warmup-era, 1 cho post-warmup split
+        # scored/unscored) để code rõ — overhead ở r=8 với queue ~30 là <10µs.
+        n_warmup_running = 0
+        for r in self.running:
+            if r.metrics.arrival_time < warmup_end:
+                n_warmup_running += 1
+
+        n_warmup_waiting = 0
+        n_post_scored = 0
+        n_post_unscored = 0
+        for r in self.waiting:
+            if r.metrics.arrival_time < warmup_end:
+                n_warmup_waiting += 1
+            elif r.aux_model_score is not None:
+                n_post_scored += 1
+            else:
+                n_post_unscored += 1
+
+        # KV cache headroom. API thống nhất giữa BlockSpaceManagerV1/V2 (đã
+        # verify trước khi viết — xem rủi ro #3 plan profile).
+        n_free = self.block_manager.get_num_free_gpu_blocks()
+        n_total = self.block_manager.num_total_gpu_blocks
+
+        # Predictor backlog — dirty read (lock-free, sai số ±1 OK).
+        # Try/except phòng aux_model là backend khác (vd GPU AUXLLMEngine)
+        # không có method stream_stats — log -1 sentinel.
+        try:
+            stream_q, stream_if = self.aux_model.stream_stats()
+        except (AttributeError, Exception):
+            stream_q, stream_if = -1, -1
+
+        # Format CSV row. Dùng f-string single — Python compile thành bytecode
+        # tối ưu, nhanh hơn ",".join cho fixed-format output.
+        self._profile_tick_fh.write(
+            f"{elapsed:.4f},{stage},"
+            f"{len(self.running)},{len(self.swapped)},{len(self.waiting)},"
+            f"{n_warmup_running},{n_warmup_waiting},"
+            f"{n_post_scored},{n_post_unscored},"
+            f"{n_free},{n_total},"
+            f"{stream_q},{stream_if}\n"
+        )
+
+    # =========================================================================
+    # [PROFILE] Tick profiler cho variant opt-cpu-async-merged
+    # =========================================================================
+    # Implementation IDENTICAL với _profile_tick_async_warmup — schema CSV
+    # giống hệt (13 cột) → reuse plot_tick_profile.py + analysis script.
+    #
+    # Khác về SEMANTIC ý nghĩa data thu được:
+    #   - stage column chỉ có giá trị 1 hoặc 2 (KHÔNG có 3 — đã collapse).
+    #   - Expected behavior khác:
+    #     * n_postwarmup_waiting_scored phải giữ THẤP (drain liên tục thay
+    #       vì build up wall như async-warmup cũ).
+    #     * Không có "Stage 2 dwell" 15-20s — transition warmup→steady-state
+    #       nên smooth.
+    #     * n_running không jump 8→248 đột ngột mà tăng dần.
+    #
+    # Output path mặc định trùng với async-warmup version (default
+    # /tmp/tick_profile_<pid>.csv hoặc env OPT_PROFILE_TICK_PATH). Bash
+    # script chỉ định path khác (vd tick_profile_merged_r8_<TS>.csv) để
+    # file CSV không đè lên data của async-warmup.
+    # =========================================================================
+    def _profile_tick_async_merged(self, stage: int, elapsed: float) -> None:
+        """[PROFILE] Variant của _profile_tick_async_warmup cho merged scheduler.
+
+        Logic + schema CSV identical — reuse cùng env gates, cùng path.
+        Tách thành method riêng để:
+          (a) caller chỉ định đúng intent (merged vs warmup) qua tên hàm
+          (b) tương lai có thể divergence nếu cần thêm field merged-specific
+              (vd burst counter sau Stage 1→2 transition)
+
+        Args:
+            stage: 1 (warmup) hoặc 2 (merged post-warmup). KHÔNG có 3.
+            elapsed: time.time() - serve_start_time, pass từ caller để
+                tránh tính 2 lần.
+        """
+        # Gate sớm — overhead khi off ~100ns.
+        if not int(os.environ.get('OPT_PROFILE_TICK', 0)):
+            return
+
+        # Defensive: chưa có request nào → warmup_end không tính được.
+        if self.serve_start_time is None:
+            return
+
+        # Lazy init file handle. Reuse attribute _profile_tick_fh — nếu cùng
+        # process từng chạy async-warmup rồi switch sang merged thì sẽ ghi
+        # tiếp vào cùng file (hiếm xảy ra vì server restart giữa 2 schedule_type).
+        if not hasattr(self, '_profile_tick_fh'):
+            path = os.environ.get(
+                'OPT_PROFILE_TICK_PATH',
+                f'/tmp/tick_profile_{os.getpid()}.csv'
+            )
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            self._profile_tick_fh = open(path, 'w', buffering=8192)
+            # Header IDENTICAL với async-warmup → plot script tự work.
+            self._profile_tick_fh.write(
+                "t_rel,stage,n_running,n_swapped,n_waiting,"
+                "n_warmup_era_running,n_warmup_era_waiting,"
+                "n_postwarmup_waiting_scored,n_postwarmup_waiting_unscored,"
+                "n_free_gpu_blocks,n_total_gpu_blocks,"
+                "stream_queue_depth,stream_in_flight\n"
+            )
+            print(f"[PROFILE] Tick profile CSV (merged): {path}")
+
+        # Inline is_warmup_era — không gọi closure để giảm overhead Python.
+        warmup_end = self.serve_start_time + self.warmup_seconds
+
+        # Đếm warmup-era / post-warmup splits (logic giống async-warmup version).
+        n_warmup_running = 0
+        for r in self.running:
+            if r.metrics.arrival_time < warmup_end:
+                n_warmup_running += 1
+
+        n_warmup_waiting = 0
+        n_post_scored = 0
+        n_post_unscored = 0
+        for r in self.waiting:
+            if r.metrics.arrival_time < warmup_end:
+                n_warmup_waiting += 1
+            elif r.aux_model_score is not None:
+                n_post_scored += 1
+            else:
+                n_post_unscored += 1
+
+        # KV cache — API thống nhất V1/V2.
+        n_free = self.block_manager.get_num_free_gpu_blocks()
+        n_total = self.block_manager.num_total_gpu_blocks
+
+        # Predictor backlog — dirty read (xem comment ở stream_stats).
+        try:
+            stream_q, stream_if = self.aux_model.stream_stats()
+        except (AttributeError, Exception):
+            stream_q, stream_if = -1, -1
+
+        self._profile_tick_fh.write(
+            f"{elapsed:.4f},{stage},"
+            f"{len(self.running)},{len(self.swapped)},{len(self.waiting)},"
+            f"{n_warmup_running},{n_warmup_waiting},"
+            f"{n_post_scored},{n_post_unscored},"
+            f"{n_free},{n_total},"
+            f"{stream_q},{stream_if}\n"
+        )
 
     def _get_ropt_ordered_requests(self):
 
@@ -1099,6 +1922,13 @@ class Scheduler:
         '''
 
     def _general_schedule(self):
+
+        # [TRACE_EVENTS] tick start
+        from vllm import event_tracer
+        _tracer_on = event_tracer.is_enabled()
+        if _tracer_on:
+            self._tick_idx += 1
+            event_tracer.log("scheduler.tick.start", {"tick": self._tick_idx})
 
         self._update_priority()
 
@@ -1369,7 +2199,17 @@ class Scheduler:
         #print('running: ', [r.request_id for r in running_this_step])
         #print('all: ', [r.request_id for r in all_pri])
         #print('----------')
-        
+
+        # [TRACE_EVENTS] tick end
+        if _tracer_on:
+            event_tracer.log("scheduler.tick.end", {
+                "tick": self._tick_idx,
+                "n_running": len(self.running),
+                "n_waiting": len(self.waiting),
+                "n_swapped": len(self.swapped),
+                "selected": len(running_this_step),
+            })
+
         return ret
 
 
