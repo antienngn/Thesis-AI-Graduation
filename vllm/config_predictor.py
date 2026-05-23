@@ -50,11 +50,26 @@ class PrefillModelConfig:
     # `device` quyết định backend chạy predictor:
     #   - "auto" (default): giữ flow cũ → AUXLLM trên GPU.
     #   - "openvino": dùng OpenVINOPredictor chạy trên CPU.
+    #   - "dual": dual scheduler — load BOTH OV CPU và AUXLLM GPU; router quyết
+    #     mỗi request route nào. Cần điền thêm gpu_predictor_config_path,
+    #     lut_cpu_path, lut_main_path bên dưới.
     # `num_threads`, `inference_precision` chỉ áp dụng khi device="openvino";
     # tham số được forward thẳng vào openvino.Core.compile_model config.
     device = attrib(type=str, default="auto")
     num_threads = attrib(type=int, default=8)
     inference_precision = attrib(type=str, default="f16")
+    # === [dual] BEGIN ===
+    # Chỉ áp dụng khi device="dual".
+    # - gpu_predictor_config_path: đường dẫn usage_config.json cho AUXLLM GPU
+    #   (predictor cùng model nhưng PyTorch trên GPU).
+    # - lut_cpu_path: JSON LUT cho n_tokens → CPU predictor latency
+    #   (build từ benchmarks/LUT_CREATE/profile_cpu_predictor_lut.py).
+    # - lut_main_path: JSON LUT cho (n_running, n_decode, n_prefill, n_tokens)
+    #   → main model latency (build từ build_main_model_lut.py).
+    gpu_predictor_config_path = attrib(type=str, default="")
+    lut_cpu_path = attrib(type=str, default="")
+    lut_main_path = attrib(type=str, default="")
+    # === [dual] END ===
     # === [opt-cpu] END ===
 
 @attrs

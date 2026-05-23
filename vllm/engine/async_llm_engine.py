@@ -263,6 +263,7 @@ class _AsyncLLMEngine(LLMEngine):
                     "n_tokens": scheduler_outputs.num_batched_tokens,
                     "n_prefill": len(plens),
                     "n_decode": len(dlens),
+                    "n_running": len(self.scheduler.running),
                     "plen_max": max(plens) if plens else 0,
                     "plen_sum": sum(plens) if plens else 0,
                     "dlen_max": max(dlens) if dlens else 0,

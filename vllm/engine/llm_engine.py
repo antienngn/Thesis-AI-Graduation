@@ -247,6 +247,74 @@ class LLMEngine:
                     num_threads=cfg.num_threads,
                     inference_precision=cfg.inference_precision,
                 )
+            elif cfg.device == "dual":
+                # === [dual] BEGIN ===
+                # Load BOTH OV CPU + AUXLLM GPU. Router quyết route per-tick.
+                from vllm.model_executor.openvino_predictor import (
+                    OpenVINOPredictor,
+                )
+                from vllm.model_executor.dual_predictor_router import (
+                    DualPredictorRouter,
+                )
+                from vllm.model_executor.dual_aux_model import DualAuxModel
+                from vllm import AUXLLM
+                from vllm.config_predictor import PrefillPredictorConfig
+
+                # CPU OV predictor: dùng các field cfg.* trực tiếp (giống openvino)
+                cpu_pred = OpenVINOPredictor(
+                    model_path=cfg.path,
+                    tokenizer_name=cfg.pred_model,
+                    num_labels=cfg.num_labels,
+                    max_length=cfg.max_length,
+                    max_batch_size=cfg.max_batch_size,
+                    num_threads=cfg.num_threads,
+                    inference_precision=cfg.inference_precision,
+                )
+                # [dual] Disable chunk: router đã quyết all-or-nothing batch
+                # → worker xử lý toàn bộ batch trong 1 OV call. Override
+                # _stream_chunk_size = max_batch_size để worker không split.
+                cpu_pred._stream_chunk_size = cfg.max_batch_size
+                print(f"[dual] disabled chunk: _stream_chunk_size = "
+                      f"{cpu_pred._stream_chunk_size}")
+                # GPU AUXLLM: load sub-config riêng (PyTorch GPU checkpoint)
+                if not cfg.gpu_predictor_config_path:
+                    raise ValueError(
+                        "device='dual' yêu cầu gpu_predictor_config_path trong config."
+                    )
+                gpu_cfg = PrefillPredictorConfig.from_json(
+                    cfg.gpu_predictor_config_path
+                ).model
+                gpu_pred = AUXLLM(
+                    model=gpu_cfg.path,
+                    tokenizer=gpu_cfg.pred_model,
+                    swap_space=0,
+                    gpu_memory_utilization=0.0,
+                    enforce_eager=True,
+                    schedule_type='fcfs',
+                    enable_chunked_prefill=False,
+                    max_model_len=gpu_cfg.max_length,
+                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                    placement_group=self.parallel_config.placement_group,
+                    llm_model_executor=self.model_executor,
+                )
+                # Router với 2 LUT + OPT tokenizer từ CPU predictor
+                # (cần để tính longest_tokens đúng đơn vị LUT CPU v4_simple)
+                if not (cfg.lut_cpu_path and cfg.lut_main_path):
+                    raise ValueError(
+                        "device='dual' yêu cầu lut_cpu_path + lut_main_path."
+                    )
+                router = DualPredictorRouter(
+                    lut_cpu_path=cfg.lut_cpu_path,
+                    lut_main_path=cfg.lut_main_path,
+                    opt_tokenizer=cpu_pred.tokenizer,
+                    max_length=cfg.max_length,
+                )
+                self.scheduler.aux_model = DualAuxModel(
+                    cpu_predictor=cpu_pred,
+                    gpu_predictor=gpu_pred,
+                    router=router,
+                )
+                # === [dual] END ===
             else:
                 # GPU path (legacy/baseline): giữ nguyên AUXLLM init.
                 from vllm import AUXLLM

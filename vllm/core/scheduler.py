@@ -291,7 +291,8 @@ class Scheduler:
         #   tokenize/request creation. Lệch ~5-50ms so với arrival_time.
         self.warmup_seconds = 0.0
         self.serve_start_time = None
-        m = re.search(r"(?:warmup|merged)(\d+\.?\d*)", self.schedule_type)
+        # Match cả 'dual<T>' (scheduler dual với warmup phase dùng GPU predictor).
+        m = re.search(r"(?:warmup|merged|dual)(\d+\.?\d*)", self.schedule_type)
         if m:
             self.warmup_seconds = float(m.group(1))
             print(f"FCFS warmup: {self.warmup_seconds}s")
@@ -377,6 +378,21 @@ class Scheduler:
             self._update_priority = self._update_opt_priority
             self.need_score = True
         # === [opt-cpu-async-merged] END ===
+        # === [dual] BEGIN: dispatch ===
+        # dual<T>: scheduler kết hợp 2 predictor (CPU OV + GPU AUXLLM).
+        #   - t < T: warmup phase, mọi request route GPU sync (giống opt-xxx)
+        #   - t >= T: post-warmup, router quyết per-request:
+        #       T_main >= T_cpu → CPU async (giấu được latency)
+        #       T_main <  T_cpu → GPU sync (CPU sẽ lộ ra)
+        # Predictor aux_model là DualAuxModel (xem dual_aux_model.py).
+        elif self.schedule_type.startswith("dual"):
+            self._schedule = self._general_schedule
+            self._get_ordered_requests = (
+                self._get_dual_predictor_ordered_requests
+            )
+            self._update_priority = self._update_opt_priority
+            self.need_score = True
+        # === [dual] END ===
         # === [opt-cpu-async] BEGIN: dispatch — phải đặt TRƯỚC "opt-cpu" ===
         # Vì "opt-cpu-async-warmup2.0".startswith("opt-cpu") cũng đúng,
         # nên nếu để sau sẽ rơi vào _get_opt_cpu_ordered_requests (legacy, sai).
@@ -1603,6 +1619,200 @@ class Scheduler:
 
         return list(sorted(schedulable, key=_sort_key))
     # === [opt-cpu-async-merged] END ===
+
+    # =========================================================================
+    # [dual] BEGIN
+    # =========================================================================
+    # dual<T>: scheduler kết hợp CPU OV + GPU AUXLLM predictor qua router.
+    #
+    # Thuật toán:
+    #   Stage 1 (t < T): GPU sync score TẤT CẢ unscored request đến trong
+    #     khoảng T → mọi request đều có score sau warmup.
+    #   Stage 2 (t >= T): bật router → quyết định batch unscored hiện tại
+    #     đi CPU hay GPU dựa trên LUT.
+    #
+    # Gate logic UNIFIED: request nào chưa có aux_model_score → KHÔNG vào
+    # schedulable (regardless warmup-era hay post-warmup).
+    #
+    # Sort UNIFIED: tất cả request có score sort cùng nhau theo -aux_model_score
+    # (SJF). Không phân biệt warmup-era vs post-warmup vì warmup-era cũng
+    # đã được GPU score trong stage 1.
+    # =========================================================================
+    def _get_dual_predictor_ordered_requests(self):
+        """dual<T>: warmup GPU sync; post-warmup router; gate+SJF unified."""
+        elapsed = (
+            0.0 if self.serve_start_time is None
+            else time.time() - self.serve_start_time
+        )
+
+        # === Stage 1: Warmup — GPU sync score mọi unscored ===
+        if elapsed < self.warmup_seconds:
+            self._profile_tick_async_merged(stage=1, elapsed=elapsed)
+            need = [r for r in self.waiting if r.need_aux_model_score()]
+            if need:
+                self.aux_model.obtain_aux_scores(need)
+            # Sau GPU sync, mọi request waiting đều có score → sort SJF.
+            # Order = waiting + running + swapped (match opt-xxx) — chỉ
+            # filter waiting unscored (defensive với case GPU sync fail).
+            schedulable = (
+                [w for w in self.waiting if w.aux_model_score is not None]
+                + list(self.running)
+                + list(self.swapped)
+            )
+            return list(sorted(schedulable, key=lambda r: -r.aux_model_score))
+
+        # === Defensive guard cho schedule_type "dual0.0" ===
+        if self.serve_start_time is None:
+            return []
+
+        # === Stage 2: Post-warmup — router quyết CPU/GPU ===
+        # [DEBUG TIMING] Gate by env DUAL_DEBUG_TIMING=1 — log per-phase timing
+        # mỗi N tick để debug slowdown ở high rate.
+        _debug = int(os.environ.get("DUAL_DEBUG_TIMING", 0))
+        _debug_interval = int(os.environ.get("DUAL_DEBUG_INTERVAL", 100))
+        _t_start = time.time() if _debug else None
+
+        # Poll CPU async results (CPU đã score xong tick trước landing ở đây)
+        self.aux_model.poll_streaming()
+        _t_poll = time.time() if _debug else None
+
+        # Build state hệ thống cho router
+        n_running = len(self.running)
+        running_decode = sum(
+            1 for sg in self.running if not sg.is_prefill()
+        )
+        running_prefill = n_running - running_decode
+        n_tokens_next = sum(
+            sg.get_seqs()[0].get_prompt_len()
+            for sg in self.running if sg.is_prefill()
+        ) + running_decode
+
+        state = {
+            "n_running":     n_running,
+            "n_decode":      running_decode,
+            "n_prefill":     running_prefill,
+            "n_tokens_next": n_tokens_next,
+        }
+        _t_state = time.time() if _debug else None
+
+        # Tìm tất cả unscored. EXCLUDE requests đang in-flight CPU (đã submit
+        # tick trước, worker chưa landing) để tránh race: scheduler có thể
+        # route GPU cho request đó → AUXLLM forward đang chạy thì CPU worker
+        # landing cross-thread → AUXLLM assert fail.
+        need_aux_scores = [
+            r for r in self.waiting
+            if r.need_aux_model_score()
+               and not self.aux_model.is_pending_cpu_score(r)
+        ]
+        _t_filter = time.time() if _debug else None
+
+        _t_route, _t_dispatch = _t_filter, _t_filter
+        _n_cpu, _n_gpu = 0, 0
+        if need_aux_scores:
+            from vllm import event_tracer
+            _trace_t0 = time.time() if event_tracer.is_enabled() else None
+            if _trace_t0 is not None:
+                event_tracer.log("dual.router.start", {
+                    "n_input": len(need_aux_scores), "state": state,
+                })
+
+            cpu_list, gpu_list = self.aux_model.route_batch(
+                need_aux_scores, state
+            )
+            _n_cpu, _n_gpu = len(cpu_list), len(gpu_list)
+            _t_route = time.time() if _debug else None
+
+            if _trace_t0 is not None:
+                event_tracer.log("dual.router.end", {
+                    "n_cpu": len(cpu_list), "n_gpu": len(gpu_list),
+                    "lat_ms": (time.time() - _trace_t0) * 1000.0,
+                })
+
+            # CPU path: async submit (non-blocking)
+            if cpu_list:
+                if _trace_t0 is not None:
+                    event_tracer.log("predictor.submit.start", {
+                        "mode": "dual_cpu", "n_input": len(cpu_list),
+                    })
+                self.aux_model.submit_streaming(cpu_list)
+                if _trace_t0 is not None:
+                    event_tracer.log("predictor.submit.end", {
+                        "mode": "dual_cpu", "n_input": len(cpu_list),
+                    })
+
+            # GPU path: sync (score landing ngay tick này)
+            # Re-filter unscored ngay trước khi gọi (race: CPU worker có thể
+            # đã landing score cho 1 request trong gpu_list giữa lúc router
+            # quyết và lúc dispatch — AUXLLM assert sẽ fail nếu pass request
+            # đã có score).
+            if gpu_list:
+                gpu_list = [r for r in gpu_list if r.need_aux_model_score()]
+            if gpu_list:
+                if _trace_t0 is not None:
+                    event_tracer.log("predictor.gpu_sync.start", {
+                        "n_input": len(gpu_list),
+                    })
+                self.aux_model.obtain_aux_scores(gpu_list)
+                if _trace_t0 is not None:
+                    event_tracer.log("predictor.gpu_sync.end", {
+                        "n_input": len(gpu_list),
+                    })
+            _t_dispatch = time.time() if _debug else None
+
+        # [DEBUG TIMING] Print per-phase ms mỗi N tick (hoặc khi tick chậm)
+        if _debug:
+            _tick_total_ms = (time.time() - _t_start) * 1000
+            _tick_idx = getattr(self, '_dual_dbg_tick', 0)
+            self._dual_dbg_tick = _tick_idx + 1
+            # Log mỗi N tick hoặc tick chậm bất thường (> 100ms)
+            if _tick_idx % _debug_interval == 0 or _tick_total_ms > 100:
+                print(
+                    f"[DUAL_DBG tick={_tick_idx}] "
+                    f"total={_tick_total_ms:.1f}ms | "
+                    f"poll={(_t_poll-_t_start)*1000:.1f} | "
+                    f"state={(_t_state-_t_poll)*1000:.1f} | "
+                    f"filter={(_t_filter-_t_state)*1000:.1f} "
+                    f"(n_unscored={len(need_aux_scores)}) | "
+                    f"route={(_t_route-_t_filter)*1000:.1f} | "
+                    f"dispatch={(_t_dispatch-_t_route)*1000:.1f} "
+                    f"(cpu={_n_cpu}, gpu={_n_gpu}) | "
+                    f"waiting={len(self.waiting)}, running={n_running}, "
+                    f"swapped={len(self.swapped)}",
+                    flush=True,
+                )
+
+        self._profile_tick_async_merged(stage=2, elapsed=elapsed)
+
+        # === Gate + sort UNIFIED ===
+        # Order = waiting + running + swapped (match opt-xxx) — chỉ filter
+        # waiting unscored (request CPU async chưa landing sẽ bị gate).
+        # Running/swapped đã có score từ tick trước.
+        schedulable = (
+            [w for w in self.waiting if w.aux_model_score is not None]
+            + list(self.running)
+            + list(self.swapped)
+        )
+
+        # Invariant: mọi request trong schedulable đều có score
+        # assert all(r.aux_model_score is not None for r in schedulable),\
+        #     "Dual invariant violated: request trong schedulable không có score."
+
+        # Sort SJF unified — tất cả request có score xếp cùng nhau
+        if self.starv != -1:
+            for r in schedulable:
+                if r.idle >= self.starv:
+                    r.pri = -1
+                    r.idle = 0
+                    r.runs = self.period
+                elif r.pri == -1 and r.runs <= 0:
+                    r.pri = 0
+            return list(sorted(
+                schedulable,
+                key=lambda r: (getattr(r, 'pri', 0), -r.aux_model_score)
+            ))
+
+        return list(sorted(schedulable, key=lambda r: -r.aux_model_score))
+    # === [dual] END ===
 
     # =========================================================================
     # [PROFILE] Tick profiler — aggregated stats per scheduler tick
