@@ -125,9 +125,8 @@ async def async_request_vllm(
             "top_p": 1.0,
             "ignore_eos": request_func_input.ignore_eos,
             "est_tokens": request_func_input.est_tokens,
-            # Deterministic sampling: cùng prompt + cùng seed → cùng output.
-            # Giữ temperature=1.0/top_p=1.0 để preserve realistic distribution
-            # (vs greedy temperature=0 sẽ shift output_len distribution).
+            # temperature=1.0 + seed=42: stochastic nhưng reproducible per (prompt, seed).
+            # → Fair compare với baseline SERVE_RES dùng cùng setting.
             "seed": 42,
         }
         headers = {

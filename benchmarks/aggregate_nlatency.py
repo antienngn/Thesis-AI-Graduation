@@ -18,16 +18,18 @@ SCHEDULER_ORDER = ["fcfs", "sjf", "srtf", "tpt-class10-xxx", "opt-xxx", "opt-cpu
 
 
 def compute_nlatency_ms(data: dict) -> tuple[float | None, float | None, int]:
+    # Use RAW streamed token count = len(itls[i]) + 1, KHÔNG dùng re-tok output_lens.
+    # Re-tok bị BPE bias do degenerate post-EOS, không phản ánh workload thật.
     ttfts = data.get("ttfts") or []
     itls = data.get("itls") or []
-    output_lens = data.get("output_lens") or []
-    if not (ttfts and itls and output_lens):
+    if not (ttfts and itls):
         return None, None, 0
     nlat = []
     for i in range(len(ttfts)):
-        if output_lens[i] > 0:
+        n_raw = len(itls[i]) + 1
+        if n_raw > 0:
             latency = ttfts[i] + sum(itls[i])
-            nlat.append(latency / output_lens[i])
+            nlat.append(latency / n_raw)
     if not nlat:
         return None, None, 0
     arr = np.asarray(nlat) * 1000.0  # s -> ms
