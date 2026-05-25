@@ -8,9 +8,11 @@
 
 > Năm học: 2025-2026
 
-Khóa luận đề xuất **Dual Predict Scheduler** — một cơ chế scheduling cho LLM serving system, mở rộng kiến trúc Learning-to-Rank (LTR) bằng cách kết hợp **hai predictor chạy song song** trên hai loại phần cứng khác nhau (CPU và GPU), điều phối bởi một **LUT-based router** quyết định route từng batch unscored requests sao cho **giấu được latency của predictor sau model executor** mà không làm chậm hot path GPU.
+Khóa luận đề xuất **Dual Predict Scheduler** — một cơ chế scheduling cho LLM serving system, mở rộng kiến trúc Learning-to-Rank (LTR) bằng cách kết hợp **hai predictor chạy song song** trên hai loại phần cứng khác nhau (CPU và GPU), điều phối bởi một **Look-Up-Tables-based router** quyết định route từng batch unscored requests sao cho **CPU predictor latency bé hơn hoặc bằng latency của một forward pass của main model** 
 
-Mã nguồn được phát triển trên nền **[vLLM-ltr](https://github.com/hao-ai-lab/vllm-ltr)** (Fu et al., 2024); phần đóng góp của khóa luận được ghi nhận chi tiết ở mục [Đóng góp](#đóng-góp-của-khóa-luận) và [Citation](#citation) ở cuối README.
+=> Thiết kế này không làm chậm main model xử lý trên GPU.
+
+Mã nguồn được phát triển trên nền **[vLLM-ltr](https://github.com/hao-ai-lab/vllm-ltr)** (Fu et al., 2024); phần đóng góp của khóa luận được ghi nhận chi tiết ở mục [Đóng góp](#đóng-góp-của-khóa-luận) và [Citation](#citation).
 
 ---
 
